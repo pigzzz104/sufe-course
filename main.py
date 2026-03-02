@@ -5,17 +5,17 @@ import os
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QLineEdit, QTableWidget,
                                QTableWidgetItem, QPlainTextEdit, QLabel, QHeaderView,
-                               QMessageBox, QSpinBox, QProgressBar, QStyle)
+                               QMessageBox, QSpinBox, QProgressBar, QStyle, QInputDialog)
 from PySide6.QtWidgets import QAbstractItemView
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import QWebEngineProfile
-from PySide6.QtCore import Slot, QTimer, QThread, Signal, Qt
+from PySide6.QtCore import Slot, QTimer, Qt
 from PySide6.QtGui import QTextCursor, QTextCharFormat, QColor
 from qt_material import apply_stylesheet
 from eams_core import EamsSession
 from workers import MonitorWorker
 from ui_extras import TopBarExtras
 from ui_components import StatusDashboard
+from auth.browser_login import BrowserLoginController
+from auth.webengine_login import LoginWindow
 
 # 表格列定义常量
 COL_NO = 0
@@ -25,94 +25,6 @@ COL_ID = 3
 COL_COUNT = 4
 COL_STATUS = 5
 COL_OP = 6
-
-
-class LoginVerifyWorker(QThread):
-    finished_signal = Signal(bool, str)
-
-    def __init__(self, eams_session, cookies):
-        super().__init__()
-        self.eams = eams_session
-        self.cookies = cookies
-
-    def run(self):
-        try:
-            self.eams.set_cookies_from_browser(self.cookies)
-            if self.eams.step1_fetch_profile_id():
-                self.finished_signal.emit(True, "验证成功")
-            else:
-                self.finished_signal.emit(False, "验证失败")
-        except Exception as e:
-            self.finished_signal.emit(False, str(e))
-
-
-class LoginWindow(QWidget):
-    login_success_signal = Signal()
-
-    def __init__(self, eams_session):
-        super().__init__()
-        self.setWindowTitle("统一身份认证")
-        self.resize(1200, 800)
-        self.eams = eams_session
-        self.login_processed = False
-        self.cookie_storage = {}
-        self.worker = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # 顶部进度条区
-        self.top_bar = QWidget()
-        self.top_bar.setFixedHeight(40)
-        self.top_bar.setStyleSheet("background-color: #f5f5f5; border-bottom: 1px solid #ddd;")
-        bar_layout = QHBoxLayout(self.top_bar)
-        self.lbl_status = QLabel("[INFO] 正在初始化浏览器...")
-        self.lbl_status.setStyleSheet("color: grey; ")
-        self.progress = QProgressBar()
-        self.progress.setFixedHeight(10)
-        self.progress.setTextVisible(False)
-        bar_layout.addWidget(self.lbl_status)
-        bar_layout.addWidget(self.progress)
-        layout.addWidget(self.top_bar)
-
-        # 浏览器
-        self.webview = QWebEngineView()
-        self.profile = QWebEngineProfile.defaultProfile()
-        self.profile.cookieStore().deleteAllCookies()
-        self.webview.loadProgress.connect(lambda p: (self.progress.setValue(p), self.lbl_status.setText(
-            f"[INFO] 加载中 {p}%..." if p < 100 else "请登录")))
-        self.lbl_status.setStyleSheet("color: grey; ")
-        self.profile.cookieStore().cookieAdded.connect(
-            lambda c: self.cookie_storage.update({c.name().data().decode(): c}))
-        layout.addWidget(self.webview)
-
-        QTimer.singleShot(200, self._start_load)
-
-    def _start_load(self):
-        self.eams.set_user_agent(self.profile.httpUserAgent())
-        self.webview.load(f"{self.eams.host}/eams/stdElectCourse.action")
-        self.webview.loadFinished.connect(self._on_load_finished)
-
-    def _on_load_finished(self, success):
-        if success and not self.login_processed and self.cookie_storage:
-            self.lbl_status.setText("[INFO] 检测到 Cookie，验证中...")
-            self.lbl_status.setStyleSheet("color: grey; ")
-            self.webview.setEnabled(False)
-            self.worker = LoginVerifyWorker(self.eams, list(self.cookie_storage.values()))
-            self.worker.finished_signal.connect(self._on_verify)
-            self.worker.start()
-
-    def _on_verify(self, success, msg):
-        if success:
-            self.login_processed = True
-            self.lbl_status.setText("[SUCCESS] 登录成功！")
-            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
-            self.login_success_signal.emit()
-            QTimer.singleShot(1000, self.close)
-        else:
-            self.webview.setEnabled(True)
-            self.lbl_status.setText("[INFO] 验证未通过，请继续登录...")
-            self.lbl_status.setStyleSheet("color: grey; ")
 
 
 class MainWindow(QMainWindow):
@@ -125,6 +37,7 @@ class MainWindow(QMainWindow):
         self.target_list = []
         self.is_logged_in = False
         self.login_window = None
+        self.browser_login_controller = None
         self.init_ui()
 
     def init_ui(self):
@@ -247,13 +160,63 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             QMessageBox.warning(self, "警告", "请先停止抢课任务！")
             return
-        if self.login_window: self.login_window.close()
-        self.login_window = LoginWindow(self.eams)
-        self.login_window.login_success_signal.connect(self.on_login_success)
-        self.login_window.show()
-        self.login_window.activateWindow()
+
+        backend = os.getenv("SUFE_LOGIN_BACKEND", "browser").strip().lower()
+        if backend == "webengine":
+            if self.login_window:
+                self.login_window.close()
+            self.login_window = LoginWindow(self.eams)
+            self.login_window.login_success_signal.connect(self.on_login_success)
+            self.login_window.show()
+            self.login_window.activateWindow()
+            self.log("[WARN] 已启用 WebEngine 登录回退模式。")
+            return
+
+        if self.browser_login_controller:
+            self.browser_login_controller.stop_server()
+
+        self.browser_login_controller = BrowserLoginController(self.eams, self)
+        self.browser_login_controller.status_signal.connect(self.log)
+        self.browser_login_controller.login_success_signal.connect(self.on_login_success)
+        self.browser_login_controller.login_failed_signal.connect(
+            lambda msg: self.log(f"[ERROR] {msg}")
+        )
+        self.browser_login_controller.start_login()
+
+
+    def _choose_profile_if_needed(self):
+        profiles = self.eams.profile_candidates or []
+        if len(profiles) <= 1:
+            return True
+
+        items = [p["title"] for p in profiles]
+        default_index = len(items) - 1
+        selected, ok = QInputDialog.getItem(
+            self,
+            "选择选课入口",
+            "检测到多个选课入口，请选择（默认最后一个）：",
+            items,
+            default_index,
+            False
+        )
+
+        if not ok:
+            self.log(f"[WARN] 未选择选课入口，使用默认入口: {profiles[-1]['title']}")
+            return True
+
+        chosen_index = next((i for i, name in enumerate(items) if name == selected), default_index)
+        chosen = profiles[chosen_index]
+        if self.eams.select_profile_by_id(chosen["id"]):
+            self.log(f"[INFO] 当前选课入口: {chosen['title']} (profileId={chosen['id']})")
+            return True
+
+        self.log("[ERROR] 选课入口切换失败。")
+        return False
 
     def on_login_success(self):
+        if not self._choose_profile_if_needed():
+            return
+
         self.is_logged_in = True
         # 不需要手动 setText 了，统一调用 update_ui_state
         self.update_ui_state()
@@ -342,14 +305,14 @@ class MainWindow(QMainWindow):
         self.table.setCellWidget(row, COL_OP, btn_del)
         self.input_no.clear()
         self.sync_worker()
-        self.log(f"[INFO] 已添加监控: {info['name']+"({})".format(info['no'])}")
+        self.log(f"[INFO] 已添加监控: {info['name']}({info['no']})")
 
     def remove_course(self, lesson_id):
         self.target_list = [t for t in self.target_list if str(t['id']) != lesson_id]
         for row in range(self.table.rowCount()):
             item = self.table.item(row, COL_ID)
             if item and item.text() == lesson_id:
-                self.log(f"[INFO] 课程 {self.table.item(row,COL_NAME).text()+"("+self.table.item(row,COL_NO).text()+")"} 已移除")
+                self.log(f"[INFO] 课程 {self.table.item(row, COL_NAME).text()}({self.table.item(row, COL_NO).text()}) 已移除")
                 self.table.removeRow(row)
                 break
         self.sync_worker()
@@ -435,7 +398,6 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --no-sandbox --log-level=3"
     app = QApplication(sys.argv)
     window = MainWindow()
     apply_stylesheet(app, theme='dark_blue.xml')
