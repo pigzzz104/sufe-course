@@ -4,12 +4,15 @@ import re
 import json
 import time
 import os
+import html
 from urllib.parse import urlencode, quote_plus
 
 
 class EamsSession:
     # 核心正则
     RE_PROFILE_ID = re.compile(r"toStdElectCourse\((\d+)\)")
+    RE_H2 = re.compile(r"<h2[^>]*>(.*?)</h2>", re.IGNORECASE | re.DOTALL)
+    RE_STRIP_TAGS = re.compile(r"<[^>]+>")
     RE_LESSON_JSONS = re.compile(r"lessonJSONs\s*=\s*\[(.*?)\];", re.DOTALL)
     RE_LESSON_ITEMS = re.compile(r"id:(\d+).*?no:'(.*?)'.*?name:'(.*?)'.*?code:'(.*?)'", re.DOTALL)
     RE_COUNTS_KEY = re.compile(r'(?<!")\b(\w+)\b\s*:', re.DOTALL)
@@ -22,6 +25,7 @@ class EamsSession:
         self.session = requests.Session()
         self.host = "https://eams.sufe.edu.cn"
         self.profile_id = None
+        self.profile_candidates = []
         self.course_db = {}
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -49,18 +53,53 @@ class EamsSession:
             print(f"[ERROR] Core Request Failed: {e}")
             return None
 
+    def _extract_profile_candidates(self, page_html):
+        ids = self.RE_PROFILE_ID.findall(page_html or "")
+        titles = []
+        for raw_title in self.RE_H2.findall(page_html or ""):
+            clean = self.RE_STRIP_TAGS.sub("", raw_title)
+            clean = html.unescape(re.sub(r"\s+", " ", clean)).strip()
+            if clean:
+                titles.append(clean)
+
+        out = []
+        seen = set()
+        for idx, pid in enumerate(ids):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            title = titles[idx] if idx < len(titles) else f"选课入口 {idx + 1}"
+            out.append({"id": pid, "title": title})
+        return out
+
+    def set_active_profile_id(self, profile_id):
+        self.profile_id = str(profile_id)
+        init_url = f"{self.host}/eams/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
+        self._request(init_url)  # 预热
+        self.headers["Referer"] = init_url
+
+    def select_profile_by_id(self, profile_id):
+        profile_id = str(profile_id)
+        if not self.profile_candidates:
+            return False
+        if profile_id not in {p["id"] for p in self.profile_candidates}:
+            return False
+        self.set_active_profile_id(profile_id)
+        return True
+
     def step1_fetch_profile_id(self):
         res = self._request(f"{self.host}/eams/stdElectCourse.action")
-        if not res: return False
+        if not res:
+            return False
 
-        match = self.RE_PROFILE_ID.search(res.text)
-        if match:
-            self.profile_id = match.group(1)
-            init_url = f"{self.host}/eams/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
-            self._request(init_url)  # 预热
-            self.headers["Referer"] = init_url
-            return True
-        return False
+        candidates = self._extract_profile_candidates(res.text)
+        self.profile_candidates = candidates
+        if not candidates:
+            return False
+
+        # 默认取最后一个选课入口
+        self.set_active_profile_id(candidates[-1]["id"])
+        return True
 
     def refresh_context(self):
         if not self.profile_id: return False

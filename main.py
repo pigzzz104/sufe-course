@@ -5,7 +5,7 @@ import os
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QLineEdit, QTableWidget,
                                QTableWidgetItem, QPlainTextEdit, QLabel, QHeaderView,
-                               QMessageBox, QSpinBox, QProgressBar, QStyle)
+                               QMessageBox, QSpinBox, QProgressBar, QStyle, QInputDialog)
 from PySide6.QtWidgets import QAbstractItemView
 from PySide6.QtCore import Slot, QTimer, Qt
 from PySide6.QtGui import QTextCursor, QTextCharFormat, QColor
@@ -183,7 +183,40 @@ class MainWindow(QMainWindow):
         )
         self.browser_login_controller.start_login()
 
+
+    def _choose_profile_if_needed(self):
+        profiles = self.eams.profile_candidates or []
+        if len(profiles) <= 1:
+            return True
+
+        items = [p["title"] for p in profiles]
+        default_index = len(items) - 1
+        selected, ok = QInputDialog.getItem(
+            self,
+            "选择选课入口",
+            "检测到多个选课入口，请选择（默认最后一个）：",
+            items,
+            default_index,
+            False
+        )
+
+        if not ok:
+            self.log(f"[WARN] 未选择选课入口，使用默认入口: {profiles[-1]['title']}")
+            return True
+
+        chosen_index = next((i for i, name in enumerate(items) if name == selected), default_index)
+        chosen = profiles[chosen_index]
+        if self.eams.select_profile_by_id(chosen["id"]):
+            self.log(f"[INFO] 当前选课入口: {chosen['title']} (profileId={chosen['id']})")
+            return True
+
+        self.log("[ERROR] 选课入口切换失败。")
+        return False
+
     def on_login_success(self):
+        if not self._choose_profile_if_needed():
+            return
+
         self.is_logged_in = True
         # 不需要手动 setText 了，统一调用 update_ui_state
         self.update_ui_state()
