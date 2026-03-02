@@ -79,7 +79,13 @@ class BrowserLoginController(QObject):
                 return
             self._handled = True
 
-        ok = self.eams.exchange_ticket_for_session(ticket=ticket, callback_service=self._callback_url, state=self._state)
+        try:
+            ok = self.eams.exchange_ticket_for_session(ticket=ticket, callback_service=self._callback_url, state=self._state)
+        except Exception as exc:
+            self.stop_server()
+            self.login_failed_signal.emit(f"ticket 换取会话异常: {exc}")
+            return
+
         self.stop_server()
 
         if ok:
@@ -95,16 +101,10 @@ class _CallbackServer(ThreadingHTTPServer):
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        callback_path = parsed.path.rstrip("/")
-        if callback_path not in ("", "/callback"):
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        params = parse_qs(parsed.query)
-        self.server.controller.status_signal.emit(f"[INFO] 收到回调请求: {parsed.path} ? {parsed.query}")
+    def _handle_callback(self, params):
+        self.server.controller.status_signal.emit(
+            f"[INFO] 收到回调请求: {self.command} {self.path}"
+        )
         self.server.controller._finish_callback(params)
 
         message = "认证结果已接收，可关闭此页面并返回客户端。"
@@ -124,6 +124,34 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        callback_path = parsed.path.rstrip("/")
+        if callback_path not in ("", "/callback"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        params = parse_qs(parsed.query)
+        self._handle_callback(params)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        callback_path = parsed.path.rstrip("/")
+        if callback_path not in ("", "/callback"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        content_len = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(content_len).decode("utf-8", errors="ignore") if content_len > 0 else ""
+        params = parse_qs(raw)
+        # 兼容 query + body 混合参数
+        if parsed.query:
+            for k, v in parse_qs(parsed.query).items():
+                params.setdefault(k, []).extend(v)
+        self._handle_callback(params)
 
     def log_message(self, fmt, *args):
         return
