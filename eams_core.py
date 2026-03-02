@@ -194,7 +194,7 @@ class EamsSession:
 
     def build_unified_auth_url(self, callback_service, state):
         """构造统一认证登录地址，默认可由环境变量覆盖。"""
-        base = os.getenv("SUFE_UNIFIED_AUTH_URL", "https://cas.sufe.edu.cn/cas/login")
+        base = os.getenv("SUFE_UNIFIED_AUTH_URL", f"{self.host}/eams/stdElectCourse.action")
         query = urlencode({"service": callback_service, "state": state})
         connector = "&" if "?" in base else "?"
         return f"{base}{connector}{query}"
