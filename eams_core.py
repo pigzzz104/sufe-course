@@ -1,0 +1,152 @@
+# --- START OF FILE eams_core.py ---
+import requests
+import re
+import json
+import time
+
+
+class EamsSession:
+    # 核心正则
+    RE_PROFILE_ID = re.compile(r"toStdElectCourse\((\d+)\)")
+    RE_LESSON_JSONS = re.compile(r"lessonJSONs\s*=\s*\[(.*?)\];", re.DOTALL)
+    RE_LESSON_ITEMS = re.compile(r"id:(\d+).*?no:'(.*?)'.*?name:'(.*?)'.*?code:'(.*?)'", re.DOTALL)
+    RE_COUNTS_KEY = re.compile(r'(?<!")\b(\w+)\b\s*:', re.DOTALL)
+    RE_TITLE = re.compile(r'<title>(.*?)</title>', re.IGNORECASE)
+    RE_ALERT = re.compile(r"alert\('(.*?)'\)")
+    RE_HTML_ERR = re.compile(r'font-size:1.5em">\s*(.*?)(?:</?br|</div>)', re.DOTALL | re.IGNORECASE)
+    RE_DIV_CONTENT = re.compile(r"content.*?>\s*(.*?)\s*</div>", re.DOTALL)
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.host = "https://eams.sufe.edu.cn"
+        self.profile_id = None
+        self.course_db = {}
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": f"{self.host}/eams/stdElectCourse.action"
+        }
+
+    def set_user_agent(self, user_agent):
+        self.headers["User-Agent"] = user_agent
+
+    def set_cookies_from_browser(self, cookie_list):
+        self.session.cookies.clear()
+        for cookie in cookie_list:
+            self.session.cookies.set(
+                cookie.name().data().decode(),
+                cookie.value().data().decode(),
+                domain=cookie.domain(),
+                path=cookie.path()
+            )
+
+    def _request(self, url, timeout=10, allow_redirects=True):
+        """内部请求封装"""
+        try:
+            return self.session.get(url, headers=self.headers, timeout=timeout, allow_redirects=allow_redirects)
+        except Exception as e:
+            print(f"[ERROR] Core Request Failed: {e}")
+            return None
+
+    def step1_fetch_profile_id(self):
+        res = self._request(f"{self.host}/eams/stdElectCourse.action")
+        if not res: return False
+
+        match = self.RE_PROFILE_ID.search(res.text)
+        if match:
+            self.profile_id = match.group(1)
+            init_url = f"{self.host}/eams/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
+            self._request(init_url)  # 预热
+            self.headers["Referer"] = init_url
+            return True
+        return False
+
+    def refresh_context(self):
+        if not self.profile_id: return False
+        url = f"{self.host}/eams/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
+        res = self._request(url, timeout=5, allow_redirects=False)
+
+        if res and res.status_code == 302:
+            print("[ERROR] Core: Session expired (302 Redirect).")
+            return False
+        if res and res.status_code == 200:
+            self.headers["Referer"] = url
+            return True
+        return False
+
+    def step2_fetch_course_data(self):
+        if not self.profile_id: return False
+        self.refresh_context()
+
+        res = self._request(f"{self.host}/eams/stdElectCourse!data.action?profileId={self.profile_id}")
+        if not res: return False
+
+        match = self.RE_LESSON_JSONS.search(res.text)
+        if match:
+            items = self.RE_LESSON_ITEMS.findall(match.group(1))
+            self.course_db = {_no: {"id": _id, "name": _name, "code": _code, "no": _no}
+                              for _id, _no, _name, _code in items}
+            return True
+        return False
+
+    def step3_query_counts(self):
+        if not self.profile_id: return {}
+        if "Referer" not in self.headers:
+            self.headers["Referer"] = f"{self.host}/eams/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
+
+        res = self._request(f"{self.host}/eams/stdElectCourse!queryStdCount.action?profileId={self.profile_id}",
+                            timeout=5)
+        if not res or res.status_code != 200: return {}
+
+        raw_json = None
+        if "window.lessonId2Counts" in res.text:
+            try:
+                raw_json = res.text.split("window.lessonId2Counts")[1].split('=', 1)[1].strip()
+                if ';' in raw_json: raw_json = raw_json.split(';')[0].strip()
+            except:
+                pass
+
+        if raw_json:
+            try:
+                json_str = raw_json.replace("'", '"')
+                json_str = self.RE_COUNTS_KEY.sub(r'"\1":', json_str)
+                return json.loads(json_str)
+            except:
+                pass
+        else:
+            title_match = self.RE_TITLE.search(res.text)
+            if title_match and ("登录" in title_match.group(1) or "认证" in title_match.group(1)):
+                print("[ERROR] Core: Cookie expired detected.")
+        return {}
+
+    def step4_submit(self, lesson_id):
+        ts = int(time.time() * 1000)
+        url = (f"{self.host}/eams/stdElectCourse!batchOperator.action?"
+               f"profileId={self.profile_id}&electLessonIds={lesson_id}&withdrawLessonIds=&v={ts}")
+
+        res = self._request(url)
+        if not res: return False, "网络请求失败"
+
+        if "成功" in res.text and "失败" not in res.text:
+            return True, "抢课成功"
+
+        tip = "未知结果"
+        tip_match = self.RE_ALERT.search(res.text)
+        if not tip_match:
+            html_match = self.RE_HTML_ERR.search(res.text)
+            if html_match:
+                extracted = html_match.group(1).strip()
+                if any(k in extracted for k in ["失败", "冲突", "限选"]):
+                    tip_match = html_match
+
+        if not tip_match:
+            tip_match = self.RE_DIV_CONTENT.search(res.text)
+
+        if tip_match:
+            tip = tip_match.group(1).strip() if isinstance(tip_match, re.Match) else str(tip_match).strip()
+        else:
+            tip = re.sub(r'<[^>]+>', '', res.text).strip()[:50]
+
+        return False, re.sub(r'\s+', ' ', tip)
+
+    def get_lesson_info_by_no(self, course_no):
+        return self.course_db.get(course_no)
