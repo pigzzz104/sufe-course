@@ -194,15 +194,14 @@ class EamsSession:
 
     def build_unified_auth_url(self, callback_service, state):
         """构造统一认证登录地址，默认可由环境变量覆盖。"""
-        base = os.getenv("SUFE_UNIFIED_AUTH_URL", f"{self.host}/eams/stdElectCourse.action")
+        base = os.getenv("SUFE_UNIFIED_AUTH_URL", "https://cas.sufe.edu.cn/cas/login")
         query = urlencode({"service": callback_service, "state": state})
         connector = "&" if "?" in base else "?"
         return f"{base}{connector}{query}"
 
     def exchange_ticket_for_session(self, ticket, callback_service, state):
         """将回调 ticket/code 换取 requests.Session 会话。"""
-        self.session.cookies.clear()
-
+        # 不清空会话，避免覆盖已建立的上下文；只在换票失败后由后续校验兜底
         exchange_tpl = os.getenv("SUFE_TICKET_EXCHANGE_URL", "").strip()
         if exchange_tpl:
             exchange_url = exchange_tpl.format(
@@ -210,10 +209,12 @@ class EamsSession:
                 service=quote_plus(callback_service),
                 state=quote_plus(state or "")
             )
-            self._request(exchange_url)
+            res = self._request(exchange_url)
         else:
             auth_url = self.build_unified_auth_url(callback_service, state)
             connector = "&" if "?" in auth_url else "?"
-            self._request(f"{auth_url}{connector}ticket={quote_plus(ticket)}")
+            res = self._request(f"{auth_url}{connector}ticket={quote_plus(ticket)}")
 
+        if not res:
+            return False
         return self.step1_fetch_profile_id()

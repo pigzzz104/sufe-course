@@ -42,6 +42,7 @@ class BrowserLoginController(QObject):
 
         self.status_signal.emit(f"[INFO] 已启动本地回调服务: 127.0.0.1:{port}")
         self.status_signal.emit("[INFO] 正在调用系统浏览器打开统一认证页面...")
+        self.status_signal.emit(f"[INFO] 认证入口: {auth_url}")
 
         if not QDesktopServices.openUrl(QUrl(auth_url)):
             self.stop_server()
@@ -96,12 +97,13 @@ class _CallbackServer(ThreadingHTTPServer):
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/callback":
+        if parsed.path.rstrip("/") != "/callback":
             self.send_response(404)
             self.end_headers()
             return
 
         params = parse_qs(parsed.query)
+        self.server.controller.status_signal.emit(f"[INFO] 收到回调请求: {parsed.path} ? {parsed.query}")
         self.server.controller._finish_callback(params)
 
         message = "认证结果已接收，可关闭此页面并返回客户端。"
