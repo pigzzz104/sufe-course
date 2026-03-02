@@ -61,23 +61,23 @@ class BrowserLoginController(QObject):
             self._server = None
 
     def _finish_callback(self, params):
-        with self._lock:
-            if self._handled:
-                return
-            self._handled = True
-
         state = params.get("state", [""])[0]
         ticket = params.get("ticket", [""])[0] or params.get("code", [""])[0]
+
+        if not ticket:
+            self.status_signal.emit("[INFO] 回调已到达，但尚未携带 ticket/code，继续等待...")
+            return
 
         if state and state != self._state:
             self.stop_server()
             self.login_failed_signal.emit("登录状态校验失败（state 不匹配）")
             return
 
-        if not ticket:
-            self.stop_server()
-            self.login_failed_signal.emit("回调中未携带 ticket/code，无法完成登录。")
-            return
+        with self._lock:
+            if self._handled:
+                self.status_signal.emit("[INFO] 重复回调已忽略。")
+                return
+            self._handled = True
 
         ok = self.eams.exchange_ticket_for_session(ticket=ticket, callback_service=self._callback_url, state=self._state)
         self.stop_server()
@@ -97,7 +97,8 @@ class _CallbackServer(ThreadingHTTPServer):
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path.rstrip("/") != "/callback":
+        callback_path = parsed.path.rstrip("/")
+        if callback_path not in ("", "/callback"):
             self.send_response(404)
             self.end_headers()
             return
@@ -109,6 +110,8 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         message = "认证结果已接收，可关闭此页面并返回客户端。"
         if "error" in params:
             message = f"认证失败: {params['error'][0]}"
+        elif not (params.get("ticket") or params.get("code")):
+            message = "尚未收到 ticket/code，请继续完成统一认证登录。"
 
         payload = (
             "<html><head><meta charset='utf-8'></head>"
